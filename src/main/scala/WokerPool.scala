@@ -49,14 +49,14 @@ object WorkerPool {
   def of[A, B](fs: List[Worker.Worker[A, B]]): IO[WorkerPool[A, B]] =
     (
       Queue
-        .bounded[IO, (A, Deferred[IO, B])](fs.length)
+        .bounded[IO, (A, Deferred[IO, Either[Throwable, B]])](fs.length)
         .product(Ref.of[IO, WorkerState](WorkerState.empty))
       )
       .flatMap { case (queue, ref) =>
         {
           fs.parTraverse { worker =>
             val single = queue.take.flatMap { case (inp, resultD) =>
-              worker(inp).flatMap { res => resultD.complete(res) }
+              worker(inp).attempt.flatMap(resultD.complete)
             }
             GenUUID[IO].uuid.product(Deferred[IO, Unit]).flatMap {
               case (uid, workerD) =>
@@ -73,9 +73,9 @@ object WorkerPool {
           new WorkerPool[A, B] {
             def exec(a: A): IO[B] =
               for {
-                d <- Deferred[IO, B]
+                d <- Deferred[IO, Either[Throwable, B]]
                 _ <- queue.offer((a, d))
-                res <- d.get
+                res <- d.get.rethrow
               } yield res
             def addWorker(worker: Worker.Worker[A, B]): IO[Worker.WorkerId] =
               for {
@@ -87,7 +87,7 @@ object WorkerPool {
                 io <- loopUntilDef(
                   queue.take
                     .flatMap { case (inp, d) =>
-                      worker(inp).flatMap { res => d.complete(res) }
+                      worker(inp).attempt.flatMap(d.complete)
                     },
                   workerD
                 ).start
@@ -109,7 +109,7 @@ object WorkerPool {
                 .modify { ws =>
                   WorkerState.empty -> ws.values.toList
                 }
-                .flatMap { _.traverse(_.complete(())) }
+                .flatMap { _.parTraverse(_.complete(())) }
                 .void
 
           }

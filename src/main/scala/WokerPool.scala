@@ -9,6 +9,7 @@ import cats.effect.std.Queue
 import cats.effect.kernel.Deferred
 import cats.effect.IOApp
 import java.util.UUID
+import cats.effect.ExitCode
 
 /** Objective
   *   - Do parallel processing, distributed over a limited number of workers,
@@ -38,6 +39,11 @@ object WorkerPool {
     def empty = Map.empty[Worker.WorkerId, Deferred[IO, Unit]]
   }
 
+  private def loopUntilDef[A](io: IO[A], d: Deferred[IO, Unit]): IO[Unit] =
+    io.foreverM
+      .race(d.get *> IO.println("Deferred completed - halting infinite loop."))
+      .void
+
   // Implement this constructor, and, correspondingly, the interface above.
   // You are free to use named or anonymous classes
   def of[A, B](fs: List[Worker.Worker[A, B]]): IO[WorkerPool[A, B]] =
@@ -48,23 +54,21 @@ object WorkerPool {
       )
       .flatMap { case (queue, ref) =>
         {
-          IO.println("before parTraverse") *>
-            fs.parTraverse { worker =>
-              val single = queue.take.flatMap { case (inp, resultD) =>
-                worker(inp).flatMap { res => resultD.complete(res) }
-              }
-              GenUUID[IO].uuid.product(Deferred[IO, Unit]).flatMap {
-                case (uid, workerD) =>
-                  IO.println(s"Seeding ref with Worker with Id of: $uid") *>
-                    ref.update(_.updated(Worker.WorkerId(uid), workerD)) *>
-                    single
-                      .untilM_(
-                        workerD.tryGet.map(!_.isEmpty)
-                      )
-                      .start /* for each worker, forever poll queue and process */
-              }
+          fs.parTraverse { worker =>
+            val single = queue.take.flatMap { case (inp, resultD) =>
+              worker(inp).flatMap { res => resultD.complete(res) }
+            }
+            GenUUID[IO].uuid.product(Deferred[IO, Unit]).flatMap {
+              case (uid, workerD) =>
+                IO.println(s"Seeding ref with Worker with Id of: $uid") *>
+                  ref.update(_.updated(Worker.WorkerId(uid), workerD)) *>
+                  loopUntilDef(
+                    single,
+                    workerD
+                  ).start /* for each worker, forever poll queue and process */
+            }
 
-            }.void
+          }.void
         }.as {
           new WorkerPool[A, B] {
             def exec(a: A): IO[B] =
@@ -77,15 +81,16 @@ object WorkerPool {
               for {
                 uid <- GenUUID[IO].uuid
                 workerId = Worker.WorkerId(uid)
-                d <- Deferred[IO, Unit]
-                _ <- IO.println(s"Adding worker with id: $uid")
-                _ <- ref.update(_.updated(workerId, d))
-                _ <- queue.take
-                  .flatMap { case (inp, d) =>
-                    worker(inp).flatMap { res => d.complete(res) }
-                  }
-                  .foreverM
-                  .start
+                workerD <- Deferred[IO, Unit]
+                _ <- IO.println(s"Adding worker with id: $workerId")
+                _ <- ref.update(_.updated(workerId, workerD))
+                io <- loopUntilDef(
+                  queue.take
+                    .flatMap { case (inp, d) =>
+                      worker(inp).flatMap { res => d.complete(res) }
+                    },
+                  workerD
+                ).start
               } yield workerId
             def removeWorker(workerId: Worker.WorkerId): IO[Unit] =
               for {
@@ -97,7 +102,6 @@ object WorkerPool {
                         .raiseError[IO, Unit]
                   }
                 }
-                _ <- ref.access
                 _ <- ref.update(_.removed(workerId))
               } yield ()
             def removeAllWorkers: IO[Unit] =
@@ -151,18 +155,29 @@ object Worker {
 }
 
 object demo extends IOApp.Simple {
-  def run: IO[Unit] = {
-    val tpio = WorkerPool.testPool
+  lazy val tpio = WorkerPool.testPool
 
-    val work = (0 to 100).toList
-    tpio.flatMap { tp =>
-      (IO.sleep(1000.millis) *> Worker
-        .mkWorker(999)
-        .flatMap(tp.addWorker)).start *>
-        work.traverse(tp.exec)
-
-    // tp.exec(2) >> tp.exec(3)
-    }.void
-
+  /** this should never terminate
+    */
+  def removeAll: IO[ExitCode] = {
+    for {
+      pool <- WorkerPool.of[Unit, Unit](List(_ => IO.sleep(2.seconds)))
+      _ <- pool.exec(()).start
+      _ <- pool.removeAllWorkers
+      _ <- pool.exec(())
+    } yield ExitCode.Error
   }
+
+  def addAndRemove: IO[Unit] = {
+    val work = (0 to 500).toList
+    tpio.flatMap { tp =>
+      val newWorker = Worker.mkWorker(999).flatMap(tp.addWorker)
+
+      (IO.sleep(500.millis) *> newWorker.flatMap { wid =>
+        IO.sleep(500.millis) *> tp.removeWorker(wid)
+      }).start *> work.parTraverse(tp.exec)
+    }.void
+  }
+  def run: IO[Unit] = removeAll.void
+
 }

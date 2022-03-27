@@ -1,0 +1,1 @@
+solutions to https://olegpy.com/cats-effect-exercises/

@@ -13,6 +13,11 @@ import cats.effect.kernel.Outcome
 import cats.effect.kernel.Resource.ExitCase
 import cats.effect.kernel.Deferred
 import cats.effect.kernel.Async
+import cats.Applicative
+import cats.effect.std.Queue
+import cats.effect.std.Supervisor
+import cats.effect.std.Console
+import cats.effect.kernel.MonadCancel
 
 sealed trait Scope[F[_]] {
   def open[A](ra: Resource[F, A]): F[A]
@@ -20,7 +25,40 @@ sealed trait Scope[F[_]] {
 
 object Scope {
   // Implement this. Add context bounds as necessary.
-  def apply[F[_]]: Resource[F, Scope[F]] = ???
+  def apply[F[_]: Async: Console]: Resource[F, Scope[F]] =
+    Resource
+      .make {
+        Ref.of[F, List[F[Unit]]] {
+          List.empty[F[Unit]]
+        }
+      } { ref =>
+        ref.get
+          .flatMap {
+            _.foldRight(false.pure[F]) { case (fin, acc) =>
+              fin.attempt.flatMap {
+                case Right(_) => acc.map(_ || false)
+                case _        => acc.map(_ || true)
+              }
+            }
+          }
+          .flatMap { b =>
+            if (b) new Exception("exc in finalizer").raiseError[F, Unit]
+            else ().pure[F]
+          }
+      }
+      .flatMap { ref =>
+        Resource.eval {
+          new Scope[F] {
+            def open[A](ra: Resource[F, A]): F[A] =
+              MonadCancel[F].uncancelable { poll =>
+                ra.allocated.flatMap { case (a, fin) =>
+                  ref.update(fin :: _) *>
+                    Console[F].println(s"using $a") *> poll(Sync[F].delay(a))
+                }
+              }
+          }.pure[F]
+        }
+      }
 }
 
 object Main extends IOApp {
@@ -43,7 +81,7 @@ object Main extends IOApp {
       crashClose: Resource[F, TestResource]
   )
 
-  def happyPath[F[_]: Async: Temporal] =
+  def happyPath[F[_]: Async: Temporal: Console] =
     test[F] { (allocs, scope, _) =>
       for {
         r1 <- scope.open(allocs.normal)
@@ -52,13 +90,15 @@ object Main extends IOApp {
       } yield ()
     } { (allocs, deallocs, ec) =>
       Sync[F].delay {
+        println(allocs)
+        println(deallocs)
         require(allocs == Vector(1, 2, 3))
         require(allocs == deallocs.reverse)
         require(ec == ExitCase.Succeeded)
       }
     }
 
-  def atomicity[F[_]: Async: Temporal] =
+  def atomicity[F[_]: Async: Temporal: Console] =
     test[F] { (allocs, scope, cancelMe) =>
       for {
         r1 <- scope.open(allocs.normal)
@@ -72,13 +112,15 @@ object Main extends IOApp {
       } yield ()
     } { (allocs, deallocs, ec) =>
       Sync[F].delay {
+        println(allocs)
+        println(deallocs)
         require(allocs == Vector(1, 2))
         require(deallocs == Vector(2, 1))
         require(ec == ExitCase.Canceled)
       }
     }
 
-  def cancelability[F[_]: Async: Temporal] =
+  def cancelability[F[_]: Async: Temporal: Console] =
     test[F] { (allocs, scope, cancelMe) =>
       for {
         r1 <- scope.open(allocs.normal)
@@ -95,7 +137,7 @@ object Main extends IOApp {
       }
     }
 
-  def errorInRelease[F[_]: Async: Temporal] =
+  def errorInRelease[F[_]: Async: Temporal: Console] =
     test[F] { (allocs, scope, _) =>
       for {
         r1 <- scope.open(allocs.normal)
@@ -104,6 +146,9 @@ object Main extends IOApp {
       } yield ()
     } { (allocs, deallocs, ec) =>
       Sync[F].delay {
+        println(ec)
+        println(allocs)
+        println(deallocs)
         require(allocs == Vector(1, 2, 3))
         require(deallocs == Vector(3, 1))
         require(ec match {
@@ -113,7 +158,7 @@ object Main extends IOApp {
       }
     }
 
-  def errorInAcquire[F[_]: Async: Temporal] =
+  def errorInAcquire[F[_]: Async: Temporal: Console] =
     test[F] { (allocs, scope, _) =>
       for {
         r1 <- scope.open(allocs.normal)
@@ -122,6 +167,9 @@ object Main extends IOApp {
       } yield ()
     } { (allocs, deallocs, ec) =>
       Sync[F].delay {
+        println(ec)
+        println(allocs)
+        println(deallocs)
         require(allocs == Vector(1))
         require(deallocs == Vector(1))
         require(ec match {
@@ -131,7 +179,7 @@ object Main extends IOApp {
       }
     }
 
-  def test[F[_]: Concurrent: Temporal](
+  def test[F[_]: Async: Temporal: Console](
       run: (Allocs[F], Scope[F], F[Unit]) => F[Unit]
   )(
       check: (Vector[Int], Vector[Int], ExitCase) => F[Unit]
